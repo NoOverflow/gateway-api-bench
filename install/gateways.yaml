@@ -18,9 +18,6 @@ metadata:
   name: istio
   namespace: istio
 spec:
-  allowedListeners:
-    namespaces:
-      from: All
   gatewayClassName: istio
   listeners:
   - protocol: HTTP
@@ -36,9 +33,6 @@ metadata:
   name: envoy-gateway
   namespace: envoy
 spec:
-  allowedListeners:
-    namespaces:
-      from: All
   gatewayClassName: envoy-gateway
   listeners:
   - protocol: HTTP
@@ -54,9 +48,6 @@ metadata:
   name: agentgateway
   namespace: agentgateway
 spec:
-  allowedListeners:
-    namespaces:
-      from: All
   gatewayClassName: agentgateway
   listeners:
   - protocol: HTTP
@@ -72,9 +63,6 @@ metadata:
   name: nginx
   namespace: nginx
 spec:
-  allowedListeners:
-    namespaces:
-      from: All
   gatewayClassName: nginx
   listeners:
   - protocol: HTTP
@@ -90,9 +78,6 @@ metadata:
   name: haproxy
   namespace: haproxy
 spec:
-  allowedListeners:
-    namespaces:
-      from: All
   gatewayClassName: haproxy
   listeners:
   - protocol: HTTP
