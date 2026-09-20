@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/howardjohn/gateway-api-bench/internal/csvwriter"
+	"github.com/howardjohn/gateway-api-bench/internal/gwaddr"
+	"github.com/howardjohn/gateway-api-bench/internal/kubewait"
 	"github.com/howardjohn/pilot-load/pkg/flag"
 	"github.com/howardjohn/pilot-load/pkg/kube"
 	"github.com/howardjohn/pilot-load/pkg/simulation/model"
@@ -26,6 +30,7 @@ type Config struct {
 	Gateways    []string
 	GracePeriod time.Duration
 	Iterations  int
+	Output      string
 }
 
 func main() {
@@ -40,6 +45,7 @@ func Command(f *pflag.FlagSet) flag.Command {
 
 	flag.Register(f, &cfg.Gateways, "gateways", "list of gateways to use").Required()
 	flag.Register(f, &cfg.Iterations, "iterations", "number of changes to make")
+	flag.Register(f, &cfg.Output, "output", "CSV file for static samples")
 	flag.Register(f, &cfg.GracePeriod, "gracePeriod", "delay between each change")
 	return flag.Command{
 		Name:        "gatewayapi-routechange",
@@ -53,7 +59,11 @@ func Command(f *pflag.FlagSet) flag.Command {
 					Client: &http.Client{},
 				}
 			}
-			return &ChangeTest{Config: cfg, State: st}, nil
+			output, err := csvwriter.New(cfg.Output, []string{"timestamp_unix_nano", "gateway", "success", "status_code", "latency_microseconds"})
+			if err != nil {
+				return nil, err
+			}
+			return &ChangeTest{Config: cfg, State: st, Output: output}, nil
 		},
 	}
 }
@@ -66,23 +76,26 @@ func parseNamespacedName(gw string) types.NamespacedName {
 type ChangeTest struct {
 	Config Config
 	State  map[types.NamespacedName]*Watcher
+	Output *csvwriter.Writer
 }
 
 var _ model.Simulation = &ChangeTest{}
 
+// Each test owns a distinctly named backend so a Service of one test never
+// selects another test's pods (they all live in the default namespace).
 const backendTemplate = `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: backend
+  name: backend-routechange
 spec:
   selector:
     matchLabels:
-      app: backend
+      app: backend-routechange
   template:
     metadata:
       labels:
-        app: backend
+        app: backend-routechange
     spec:
       containers:
       - name: backend
@@ -98,10 +111,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend
+  name: backend-routechange
 spec:
   selector:
-    app: backend
+    app: backend-routechange
   ports:
   - name: http
     port: 80
@@ -128,7 +141,7 @@ spec:
   {{ end }}
   rules:
     - backendRefs:
-        - name: backend
+        - name: backend-routechange
           port: {{ if .Rand }}80{{ else }}8080{{end}}
 {{ if .Rand }}
           filters:
@@ -158,15 +171,21 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 		if g == nil {
 			return fmt.Errorf("gateway %v not found", gw.Name)
 		}
-		a := g.Status.Addresses
-		if len(a) == 0 {
+		status := ""
+		if a := g.Status.Addresses; len(a) > 0 {
+			status = a[0].Value
+		}
+		gw.Address = gwaddr.Resolve(gw.Name, status)
+		if gw.Address == "" {
 			return fmt.Errorf("gateway %v has no address", gw.Name)
 		}
-		gw.Address = a[0].Value
 	}
 
 	if err := kube.ApplyTemplate(ctx.Client, "default", backendTemplate, nil); err != nil {
 		return err
+	}
+	if err := kubewait.Rollout("default", "backend-routechange", "app=backend-routechange", 2*time.Minute); err != nil {
+		return fmt.Errorf("wait for backend readiness: %w", err)
 	}
 
 	data := cfg{
@@ -186,7 +205,7 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 			return err
 		}
 		g.Go(func() error {
-			err := gw.Probe(ctx, "route.example.com")
+			err := gw.Probe(ctx, "route.example.com", a.Output)
 			if err != nil {
 				done <- err
 			}
@@ -226,13 +245,17 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 }
 
 func (a *ChangeTest) Cleanup(ctx model.Context) error {
+	defer a.Output.Close()
 	a.Report()
 	spec := tmpl.MustEvaluate(backendChangeTemplate, cfg{
 		Namespace: "default",
 		Gateways:  a.Config.Gateways,
 	})
 	if err := kube.DeleteRaw(ctx.Client, "default", spec); err != nil {
-		return nil
+		log.Errorf("failed to delete route: %v", err)
+	}
+	if err := kubewait.DeleteDocs(backendTemplate, func(doc string) error { return kube.DeleteRaw(ctx.Client, "default", doc) }); err != nil {
+		log.Errorf("failed to delete backend: %v", err)
 	}
 
 	return nil
@@ -240,16 +263,17 @@ func (a *ChangeTest) Cleanup(ctx model.Context) error {
 
 func (a *ChangeTest) Report() {
 	for _, gw := range a.State {
-		// TODO: average latency, total latency, max
-		log.WithLabels("gateway", gw.Name, "requests", gw.Iters).Info("test complete")
+		log.WithLabels("gateway", gw.Name, "requests", gw.Iters, "successes", gw.Successes, "failures", gw.Failures).Info("test complete")
 	}
 }
 
 type Watcher struct {
-	Name    types.NamespacedName
-	Client  *http.Client
-	Address string
-	Iters   int
+	Name      types.NamespacedName
+	Client    *http.Client
+	Address   string
+	Iters     int
+	Successes int
+	Failures  int
 }
 
 func (w *Watcher) AwaitReady(ctx context.Context, hostname string) error {
@@ -279,7 +303,7 @@ func (w *Watcher) AwaitReady(ctx context.Context, hostname string) error {
 	return fmt.Errorf("route never became ready")
 }
 
-func (w *Watcher) Probe(ctx context.Context, hostname string) error {
+func (w *Watcher) Probe(ctx context.Context, hostname string, output *csvwriter.Writer) error {
 	log := log.WithLabels("gateway", w.Name.String())
 	delay := time.Microsecond
 	for {
@@ -293,16 +317,33 @@ func (w *Watcher) Probe(ctx context.Context, hostname string) error {
 		req.Host = hostname
 		resp, err := w.Client.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		c := resp.StatusCode
-		if c != 200 {
-			res, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("unexpected status code on iteration %d for gateway %v: %d. Body:\n%v", w.Iters, w.Name, c, string(res))
+		latency := time.Since(t0)
+		if err := output.Write([]string{
+			strconv.FormatInt(time.Now().UnixNano(), 10),
+			w.Name.String(),
+			strconv.FormatBool(c == http.StatusOK),
+			strconv.Itoa(c),
+			strconv.FormatInt(latency.Microseconds(), 10),
+		}); err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("write static sample: %w", err)
 		}
-		io.Copy(io.Discard, resp.Body)
+		if c != http.StatusOK {
+			w.Failures++
+			res, _ := io.ReadAll(resp.Body)
+			log.Debugf("unexpected status code on iteration %d: %d. Body:\n%v", w.Iters, c, string(res))
+		} else {
+			w.Successes++
+			io.Copy(io.Discard, resp.Body)
+		}
 		resp.Body.Close()
-		log.WithLabels("latency", time.Since(t0)).Debugf("probe completed: %v", c)
+		log.WithLabels("latency", latency).Debugf("probe completed: %v", c)
 		if !sleep.UntilContext(ctx, delay) {
 			return nil
 		}

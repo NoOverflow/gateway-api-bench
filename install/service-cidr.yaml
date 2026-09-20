@@ -1,0 +1,7 @@
+apiVersion: networking.k8s.io/v1
+kind: ServiceCIDR
+metadata:
+  name: gateway-api-bench
+spec:
+  cidrs:
+  - 10.218.0.0/16

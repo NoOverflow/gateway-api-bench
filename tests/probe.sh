@@ -5,10 +5,13 @@ WD=$(cd "$WD"; pwd)
 source "$WD/common.sh"
 
 
-if [[ "$mode" == "split" ]];then
-  for gw in "${gateways[@]}"; do
-    go run "${WD}/probe/probe.go" --gateways="$gw" `log-flag` "$@"
-  done
+# Default to one gateway at a time so each is measured in isolation (probing all
+# gateways concurrently starves them on a CPU-constrained node). Set COMBINED=1
+# to probe all gateways in a single run instead.
+if [[ "${COMBINED:-}" == "1" ]]; then
+  run-in-cluster "${WD}/probe" --gateways="$(join_by ',' "${gateways[@]}")" `log-flag` "$@"
 else
-  go run "${WD}/probe/probe.go" --gateways="$(join_by ',' "${gateways[@]}")" `log-flag` "$@"
+  for gw in "${gateways[@]}"; do
+    run-in-cluster "${WD}/probe" --gateways="$gw" `log-flag` "$@"
+  done
 fi

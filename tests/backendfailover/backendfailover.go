@@ -8,9 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/howardjohn/gateway-api-bench/internal/csvwriter"
+	"github.com/howardjohn/gateway-api-bench/internal/gwaddr"
+	"github.com/howardjohn/gateway-api-bench/internal/kubewait"
 	"github.com/howardjohn/pilot-load/pkg/flag"
 	"github.com/howardjohn/pilot-load/pkg/kube"
 	"github.com/howardjohn/pilot-load/pkg/simulation/model"
@@ -31,6 +36,7 @@ type Config struct {
 	GracePeriod  time.Duration
 	Iterations   int
 	VictoriaLogs string
+	Output       string
 }
 
 func main() {
@@ -45,6 +51,7 @@ func Command(f *pflag.FlagSet) flag.Command {
 
 	flag.Register(f, &cfg.Gateways, "gateways", "list of gateways to use").Required()
 	flag.Register(f, &cfg.Iterations, "iterations", "number of changes to make")
+	flag.Register(f, &cfg.Output, "output", "CSV file for static samples")
 	flag.Register(f, &cfg.VictoriaLogs, "victoria", "victoria-logs address")
 	flag.Register(f, &cfg.GracePeriod, "gracePeriod", "delay between each change")
 	return flag.Command{
@@ -59,7 +66,11 @@ func Command(f *pflag.FlagSet) flag.Command {
 					Client: &http.Client{},
 				}
 			}
-			return &ChangeTest{Config: cfg, State: st}, nil
+			output, err := csvwriter.New(cfg.Output, []string{"timestamp_unix_nano", "gateway", "backend_phase", "success", "backend", "status_code"})
+			if err != nil {
+				return nil, err
+			}
+			return &ChangeTest{Config: cfg, State: st, Output: output, BackendHealthy: true}, nil
 		},
 	}
 }
@@ -72,6 +83,10 @@ func parseNamespacedName(gw string) types.NamespacedName {
 type ChangeTest struct {
 	Config Config
 	State  map[types.NamespacedName]*Watcher
+	Output *csvwriter.Writer
+
+	mu             sync.RWMutex
+	BackendHealthy bool
 }
 
 var _ model.Simulation = &ChangeTest{}
@@ -83,7 +98,7 @@ metadata:
   name: backend-unhealthy
   namespace: default
   labels:
-    app: backend
+    app: backend-failover
     mode: unhealthy
   annotations:
     prometheus.io/port: "9999"
@@ -112,13 +127,13 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: backend
+      app: backend-failover
       mode: healthy
   replicas: 3
   template:
     metadata:
       labels:
-        app: backend
+        app: backend-failover
         mode: healthy
       annotations:
         prometheus.io/port: "9999"
@@ -140,56 +155,11 @@ metadata:
   namespace: default
 spec:
   selector:
-    app: backend
+    app: backend-failover
   ports:
   - name: http
     port: 80
     targetPort: 8080
----
-apiVersion: networking.istio.io/v1
-kind: DestinationRule
-metadata:
-  name: outlier
-  namespace: default
-spec:
-  host: backend
-  trafficPolicy:
-    outlierDetection:
-      baseEjectionTime: 10s
-      consecutive5xxErrors: 5
-      consecutiveGatewayErrors: 5
-      consecutiveLocalOriginFailures: 5
-      maxEjectionPercent: 100
-      splitExternalLocalOriginErrors: true
----
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: BackendTrafficPolicy
-metadata:
-  name: outlier
-  namespace: envoy
-spec:
-  targetRefs:
-    - group: gateway.networking.k8s.io
-      kind: Gateway
-      name: envoy-gateway
-  healthCheck:
-    passive:
-      baseEjectionTime: 10s
-      consecutive5XxErrors: 5
-      consecutiveGatewayErrors: 5
-      consecutiveLocalOriginFailures: 5
-      maxEjectionPercent: 100
-      splitExternalLocalOriginErrors: true
-    panicThreshold: 0
-    active:
-      http:
-        path: /healthz
-        expectedStatuses: [200]
-      healthyThreshold: 1
-      unhealthyThreshold: 1
-      interval: 1s
-      timeout: 1s
-      type: HTTP
 `
 
 const routeTemplate = `
@@ -212,13 +182,16 @@ spec:
 {{ range $r := until 16 }}
     - backendRefs:
         - name: backend
-          port: 80      
+          port: 80
+      # NOTE: retries are left at each implementation's default. Gateway API
+      # v1.6 requires HTTPRouteRetry.attempts >= 1, so retries can no longer be
+      # disabled through the API (the v2 report used retry.attempts=0); Istio,
+      # HAProxy and Nginx retry failed requests by default, agentgateway and
+      # Envoy Gateway do not.
       matches:
       - path:
           type: PathPrefix
           value: /{{add (mul 16 $rr) $r}}
-      retry:
-        attempts: 0
 {{ end }}
 ---
 {{ end }}
@@ -242,17 +215,26 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 		if g == nil {
 			return fmt.Errorf("gateway %v not found", gw.Name)
 		}
-		a := g.Status.Addresses
-		if len(a) == 0 {
+		status := ""
+		if a := g.Status.Addresses; len(a) > 0 {
+			status = a[0].Value
+		}
+		gw.Address = gwaddr.Resolve(gw.Name, status)
+		if gw.Address == "" {
 			return fmt.Errorf("gateway %v has no address", gw.Name)
 		}
-		gw.Address = a[0].Value
 	}
 
 	if err := kube.ApplyTemplate(ctx.Client, "", backendTemplate, nil); err != nil {
 		return err
 	}
-	_ = exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables", "-D", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset").Run()
+	if err := kubewait.Rollout("default", "backend-healthy", "app=backend-failover", 2*time.Minute); err != nil {
+		return fmt.Errorf("wait for healthy backends: %w", err)
+	}
+	if err := exec.Command("kubectl", "wait", "--namespace=default", "--for=condition=Ready", "pod/backend-unhealthy", "--timeout=2m").Run(); err != nil {
+		return fmt.Errorf("wait for unhealthy backend: %w", err)
+	}
+	_ = exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables-nft", "-D", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset").Run()
 
 	data := cfg{
 		Namespace: "default",
@@ -277,33 +259,35 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 	log.Infof("all gateways are ready... probing")
 	for _, gw := range a.State {
 		g.Go(func() error {
-			err := gw.Probe(ctx, "route.example.com", reporter)
+			err := gw.Probe(ctx, "route.example.com", reporter, a.Output, a.BackendPhase)
 			if err != nil {
 				done <- err
 			}
 			return err
 		})
 	}
-	for iter := range 5 {
+	for iter := range a.Config.Iterations {
 		log := log.WithLabels("iter", iter)
 		sleep.UntilContext(ctx, time.Second*22)
-		c := exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables", "-A", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset")
+		c := exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables-nft", "-A", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset")
 		c.Stderr = os.Stderr
 		c.Stdout = os.Stdout
 
 		if err := c.Run(); err != nil {
 			return err
 		}
+		a.SetBackendHealthy(false)
 		log.Infof("pod marked unhealthy")
 
 		sleep.UntilContext(ctx, time.Second*22)
-		c = exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables", "-D", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset")
+		c = exec.Command("kubectl", "exec", "--namespace=default", "backend-unhealthy", "--", "iptables-nft", "-D", "INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset")
 		c.Stderr = os.Stderr
 		c.Stdout = os.Stdout
 
 		if err := c.Run(); err != nil {
 			return err
 		}
+		a.SetBackendHealthy(true)
 		log.Infof("pod marked healthy")
 
 	}
@@ -312,13 +296,36 @@ func (a *ChangeTest) Run(ctx model.Context) error {
 	return nil
 }
 
+func (a *ChangeTest) SetBackendHealthy(healthy bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.BackendHealthy = healthy
+}
+
+func (a *ChangeTest) BackendPhase() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.BackendHealthy {
+		return "healthy"
+	}
+	return "unhealthy"
+}
+
 func (a *ChangeTest) Cleanup(ctx model.Context) error {
+	defer a.Output.Close()
 	spec := tmpl.MustEvaluate(routeTemplate, cfg{
 		Namespace: "default",
 		Gateways:  a.Config.Gateways,
 	})
-	if err := kube.DeleteRaw(ctx.Client, "default", spec); err != nil {
-		return nil
+	// DeleteRaw only handles a single object, but the route template renders 16
+	// HTTPRoutes; delete each document so no routes leak into later tests.
+	for _, doc := range strings.Split(spec, "\n---") {
+		if strings.TrimSpace(doc) == "" {
+			continue
+		}
+		if err := kube.DeleteRaw(ctx.Client, "default", doc); err != nil {
+			log.Errorf("failed to delete route: %v", err)
+		}
 	}
 
 	return nil
@@ -331,40 +338,44 @@ type Watcher struct {
 	Iters   int
 }
 
+// AwaitReady waits until every one of the 16 HTTPRoutes (one path prefix per
+// route: /0, /16, ... /240) is served, so 404s from routes that are still
+// propagating are not counted as failover failures.
 func (w *Watcher) AwaitReady(ctx context.Context, hostname string) error {
 	delay := time.Millisecond * 25
-	for {
-		w.Iters++
-		url := fmt.Sprintf("http://%s/%d", w.Address, w.Iters)
-		req, err := http.NewRequest("GET", url, nil)
-
-		if err != nil {
-			return err
-		}
-		req.Host = hostname
-		resp, err := w.Client.Do(req)
-		if err != nil {
-			return err
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		log.Infof("probing %v: %v", hostname, resp.StatusCode)
-		if resp.StatusCode == 200 {
-			return nil
-		}
-		if !sleep.UntilContext(ctx, delay) {
-			return fmt.Errorf("context cancelled")
+	for route := 0; route < 16; route++ {
+		for {
+			url := fmt.Sprintf("http://%s/%d", w.Address, route*16)
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				return err
+			}
+			req.Host = hostname
+			resp, err := w.Client.Do(req)
+			if err != nil {
+				return err
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			log.Infof("probing %v route %d: %v", hostname, route, resp.StatusCode)
+			if resp.StatusCode == 200 {
+				break
+			}
+			if !sleep.UntilContext(ctx, delay) {
+				return fmt.Errorf("context cancelled")
+			}
 		}
 	}
-	return fmt.Errorf("route never became ready")
+	return nil
 }
 
 var HostnameRegex = regexp.MustCompile("Hostname=(.*)")
 
-func (w *Watcher) Probe(ctx context.Context, hostname string, reporter *victoria.BatchReporter[VicLogEntry]) error {
+func (w *Watcher) Probe(ctx context.Context, hostname string, reporter *victoria.BatchReporter[VicLogEntry], output *csvwriter.Writer, backendPhase func() string) error {
 	log := log.WithLabels("gateway", w.Name.String())
 	t := time.NewTicker(time.Millisecond * 5)
 	for {
+		phase := backendPhase()
 		t0 := time.Now()
 		w.Iters++
 		//url := fmt.Sprintf("http://%s/%d", w.Address, 1)
@@ -398,7 +409,15 @@ func (w *Watcher) Probe(ctx context.Context, hostname string, reporter *victoria
 				lg.Backend = string(m[1])
 			}
 		}
+		// A failed response has no backend hostname. This benchmark injects
+		// failures only into backend-unhealthy, so retain that attribution.
+		if !lg.Success && lg.Backend == "" {
+			lg.Backend = "backend-unhealthy"
+		}
 		reporter.Report(lg)
+		if err := output.Write([]string{strconv.FormatInt(lg.Time, 10), w.Name.String(), phase, strconv.FormatBool(lg.Success), lg.Backend, strconv.Itoa(c)}); err != nil {
+			return fmt.Errorf("write static sample: %w", err)
+		}
 		resp.Body.Close()
 		log.WithLabels("latency", time.Since(t0)).Debugf("probe completed: %v", c)
 		select {

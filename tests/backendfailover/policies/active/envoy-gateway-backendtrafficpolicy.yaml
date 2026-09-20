@@ -1,0 +1,31 @@
+# Backend failover "active health check" variant (Envoy Gateway only): probes
+# every route backend once per second out of band, in addition to the passive
+# outlier detection of the "outlier" variant.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: outlier
+  namespace: envoy
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: envoy-gateway
+  healthCheck:
+    active:
+      type: HTTP
+      http:
+        path: /healthz
+        expectedStatuses: [200]
+      healthyThreshold: 1
+      unhealthyThreshold: 1
+      interval: 1s
+      timeout: 1s
+    passive:
+      baseEjectionTime: 10s
+      consecutive5XxErrors: 5
+      consecutiveGatewayErrors: 5
+      consecutiveLocalOriginFailures: 5
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
+    panicThreshold: 0

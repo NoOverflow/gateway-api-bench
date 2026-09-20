@@ -1,0 +1,23 @@
+# Backend failover "outlier detection" variant: the same passive health-check
+# settings as the Istio DestinationRule, attached to the Envoy Gateway Gateway.
+# Only passive checks are configured so the comparison with Istio stays
+# apples-to-apples (Envoy Gateway's active health checks are a separate variant).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: outlier
+  namespace: envoy
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: envoy-gateway
+  healthCheck:
+    passive:
+      baseEjectionTime: 10s
+      consecutive5XxErrors: 5
+      consecutiveGatewayErrors: 5
+      consecutiveLocalOriginFailures: 5
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
+    panicThreshold: 0

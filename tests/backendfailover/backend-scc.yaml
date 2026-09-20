@@ -1,0 +1,41 @@
+# OpenShift only: the backendfailover test injects failures by running iptables
+# inside its "backend-unhealthy" pod, which therefore needs to run as root and
+# hold NET_ADMIN/NET_RAW. No built-in SCC grants exactly that without being
+# fully privileged, so define a minimal custom SCC (arbitrary UID including 0 +
+# NET_ADMIN/NET_RAW) and grant it to the default namespace's default service
+# account, which is the account the test's pods run under.
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: backendfailover-scc
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: true
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: false
+allowedCapabilities:
+  - NET_ADMIN
+  - NET_RAW
+requiredDropCapabilities: []
+seccompProfiles:
+  - runtime/default
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - projected
+  - secret
+users:
+  - system:serviceaccount:default:default
+groups: []

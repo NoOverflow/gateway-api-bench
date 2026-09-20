@@ -215,3 +215,22 @@ spec:
             name: grafana
         - name: storage
           emptyDir: {}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  creationTimestamp: null
+  labels:
+    app.kubernetes.io/instance: grafana
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/version: 12.0.1
+    helm.sh/chart: grafana-8.6.3
+  name: grafana
+  namespace: monitoring
+spec:
+  port:
+    targetPort: service
+  to:
+    kind: ""
+    name: grafana
+    weight: null

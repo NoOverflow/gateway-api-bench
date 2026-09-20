@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/howardjohn/gateway-api-bench/internal/csvwriter"
+	"github.com/howardjohn/gateway-api-bench/internal/gwaddr"
+	"github.com/howardjohn/gateway-api-bench/internal/kubewait"
 	"github.com/howardjohn/pilot-load/pkg/flag"
 	"github.com/howardjohn/pilot-load/pkg/kube"
 	"github.com/howardjohn/pilot-load/pkg/simulation/model"
@@ -29,6 +33,7 @@ type Config struct {
 	VictoriaLogs string
 	Routes       int
 	InitialRoute int
+	Output       string
 }
 
 func main() {
@@ -43,6 +48,7 @@ func Command(f *pflag.FlagSet) flag.Command {
 	flag.Register(f, &cfg.Gateways, "gateways", "list of gateways to use").Required()
 	flag.Register(f, &cfg.Routes, "routes", "number of routes")
 	flag.Register(f, &cfg.InitialRoute, "initial-route", "which route to start tests on")
+	flag.Register(f, &cfg.Output, "output", "CSV file for static samples")
 	flag.Register(f, &cfg.VictoriaLogs, "victoria", "victoria-logs address")
 	flag.Register(f, &cfg.GracePeriod, "gracePeriod", "delay between each application")
 	return flag.Command{
@@ -59,7 +65,11 @@ func Command(f *pflag.FlagSet) flag.Command {
 					Samples: nil,
 				}
 			}
-			return &ProbeTest{Config: cfg, State: st}, nil
+			output, err := csvwriter.New(cfg.Output, []string{"timestamp_unix_nano", "gateway", "route", "latency_microseconds", "errors"})
+			if err != nil {
+				return nil, err
+			}
+			return &ProbeTest{Config: cfg, State: st, Output: output}, nil
 		},
 	}
 }
@@ -72,23 +82,26 @@ func parseNamespacedName(gw string) types.NamespacedName {
 type ProbeTest struct {
 	Config Config
 	State  map[types.NamespacedName]*Watcher
+	Output *csvwriter.Writer
 }
 
 var _ model.Simulation = &ProbeTest{}
 
+// Each test owns a distinctly named backend so a Service of one test never
+// selects another test's pods (they all live in the default namespace).
 const backendTemplate = `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: backend
+  name: backend-probe
 spec:
   selector:
     matchLabels:
-      app: backend
+      app: backend-probe
   template:
     metadata:
       labels:
-        app: backend
+        app: backend-probe
     spec:
       containers:
       - name: backend
@@ -101,15 +114,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: backend
+  name: backend-probe
 spec:
   selector:
-    app: backend
+    app: backend-probe
   ports:
   - name: http
     port: 80
     targetPort: 8080
-
 `
 
 const cfgTemplate = `
@@ -129,7 +141,7 @@ spec:
   {{ end }}
   rules:
     - backendRefs:
-        - name: backend
+        - name: backend-probe
           port: 80
       filters:
       - type: RequestHeaderModifier
@@ -179,15 +191,21 @@ func (a *ProbeTest) Run(ctx model.Context) error {
 		if g == nil {
 			return fmt.Errorf("gateway %v not found", gw.Name)
 		}
-		a := g.Status.Addresses
-		if len(a) == 0 {
+		status := ""
+		if a := g.Status.Addresses; len(a) > 0 {
+			status = a[0].Value
+		}
+		gw.Address = gwaddr.Resolve(gw.Name, status)
+		if gw.Address == "" {
 			return fmt.Errorf("gateway %v has no address", gw.Name)
 		}
-		gw.Address = a[0].Value
 	}
 
 	if err := kube.ApplyTemplate(ctx.Client, "default", backendTemplate, nil); err != nil {
 		return err
+	}
+	if err := kubewait.Rollout("default", "backend-probe", "app=backend-probe", 2*time.Minute); err != nil {
+		return fmt.Errorf("wait for backend readiness: %w", err)
 	}
 	for r := range a.Config.Routes {
 		type cfg struct {
@@ -215,7 +233,7 @@ func (a *ProbeTest) Run(ctx model.Context) error {
 		for _, gw := range a.State {
 			hostname := fmt.Sprintf("%d-route.example.com", r)
 			g.Go(func() error {
-				if err := gw.Probe(ctx.Context, hostname, r); err != nil {
+				if err := gw.Probe(ctx.Context, hostname, r, a.Output); err != nil {
 					return fmt.Errorf("%v: %v", gw.Name, err)
 				}
 				return nil
@@ -225,7 +243,7 @@ func (a *ProbeTest) Run(ctx model.Context) error {
 			return err
 		}
 		// Periodically report
-		if r%50 == 0 {
+		if (r+1)%50 == 0 {
 			a.Report()
 		}
 	}
@@ -235,6 +253,7 @@ func (a *ProbeTest) Run(ctx model.Context) error {
 }
 
 func (a *ProbeTest) Cleanup(ctx model.Context) error {
+	defer a.Output.Close()
 	a.Report()
 
 	for r := range a.Config.Routes {
@@ -249,8 +268,11 @@ func (a *ProbeTest) Cleanup(ctx model.Context) error {
 			Gateways:  a.Config.Gateways,
 		})
 		if err := kube.DeleteRaw(ctx.Client, "default", spec); err != nil {
-			return nil
+			log.Errorf("failed to delete route %d: %v", r, err)
 		}
+	}
+	if err := kubewait.DeleteDocs(backendTemplate, func(doc string) error { return kube.DeleteRaw(ctx.Client, "default", doc) }); err != nil {
+		log.Errorf("failed to delete backend: %v", err)
 	}
 	return nil
 }
@@ -328,7 +350,7 @@ type Watcher struct {
 	Samples []Sample
 }
 
-func (w *Watcher) Probe(ctx context.Context, hostname string, r int) error {
+func (w *Watcher) Probe(ctx context.Context, hostname string, r int, output *csvwriter.Writer) error {
 	log := log.WithLabels("gateway", w.Name.String(), "iter", r)
 	t0 := time.Now()
 	delay := time.Millisecond * 5
@@ -360,6 +382,9 @@ func (w *Watcher) Probe(ctx context.Context, hostname string, r int) error {
 				Iter:    r,
 				Errors:  errors,
 			})
+			if err := output.Write([]string{strconv.FormatInt(tn.UnixNano(), 10), w.Name.String(), strconv.Itoa(r), strconv.FormatInt(tn.Sub(t0).Microseconds(), 10), strconv.Itoa(errors)}); err != nil {
+				return fmt.Errorf("write static sample: %w", err)
+			}
 			// success!
 			// Todo continue a few to ensure we get 200 consistently
 			log.WithLabels("latency", tn.Sub(t0)).Infof("probe completed: %v", c)

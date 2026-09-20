@@ -55,10 +55,11 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/name: victoria-logs-single
     spec:
+      # runAsUser/fsGroup are intentionally omitted so OpenShift's restricted-v2
+      # SCC assigns a UID/fsGroup from the namespace range (a pinned UID 1000
+      # falls outside that range and is rejected).
       securityContext:
-        fsGroup: 2000
         runAsNonRoot: true
-        runAsUser: 1000
       containers:
         - name: vlogs
           securityContext:

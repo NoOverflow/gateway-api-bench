@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/howardjohn/gateway-api-bench/internal/csvwriter"
 	"github.com/howardjohn/pilot-load/pkg/flag"
 	"github.com/howardjohn/pilot-load/pkg/simulation"
 	"github.com/howardjohn/pilot-load/pkg/simulation/model"
@@ -28,6 +30,7 @@ type Config struct {
 	GracePeriod  time.Duration
 	VictoriaLogs string
 	Routes       int
+	Output       string
 }
 
 func main() {
@@ -41,6 +44,7 @@ func Command(f *pflag.FlagSet) flag.Command {
 
 	flag.Register(f, &cfg.Gateways, "gateways", "list of gateways to use").Required()
 	flag.Register(f, &cfg.Routes, "routes", "number of routes")
+	flag.Register(f, &cfg.Output, "output", "CSV file for static samples")
 	flag.Register(f, &cfg.VictoriaLogs, "victoria", "victoria-logs address")
 	flag.Register(f, &cfg.GracePeriod, "gracePeriod", "delay between each application")
 	return flag.Command{
@@ -56,7 +60,11 @@ func Command(f *pflag.FlagSet) flag.Command {
 					Samples: nil,
 				}
 			}
-			return &AttachedRoutes{Config: cfg, State: st}, nil
+			output, err := csvwriter.New(cfg.Output, []string{"timestamp_unix_nano", "gateway", "attached_routes"})
+			if err != nil {
+				return nil, err
+			}
+			return &AttachedRoutes{Config: cfg, State: st, Output: output}, nil
 		},
 	}
 }
@@ -74,9 +82,9 @@ type ApiDetails struct {
 type AttachedRoutes struct {
 	Config Config
 	State  map[types.NamespacedName]*Watcher
+	Output *csvwriter.Writer
 
 	startTime     time.Time
-	ready         time.Duration
 	teardownStart time.Duration
 }
 
@@ -147,6 +155,10 @@ func (a *AttachedRoutes) Run(ctx model.Context) error {
 			Time:           time.Now(),
 			AttachedRoutes: ar,
 		})
+		if err := a.Output.Write([]string{strconv.FormatInt(time.Now().UnixNano(), 10), key.String(), strconv.Itoa(ar)}); err != nil {
+			errCh <- fmt.Errorf("write static sample: %w", err)
+			return
+		}
 		if !wasProcessed {
 			if err := a.AllEqual(key, a.Config.Routes); err != nil {
 				log.Infof("not yet processed: %v", err)
@@ -178,7 +190,8 @@ func (a *AttachedRoutes) Run(ctx model.Context) error {
 	for {
 		select {
 		case <-running:
-			a.ready = time.Since(a.startTime)
+			// This signal is independent of Gateway status updates and may arrive
+			// after routes are attached, so it is not part of the measured duration.
 			running = nil
 		case <-ctx.Done():
 			clsCtx.Cancel()
@@ -206,6 +219,7 @@ func (a *AttachedRoutes) Run(ctx model.Context) error {
 }
 
 func (a *AttachedRoutes) Cleanup(ctx model.Context) error {
+	defer a.Output.Close()
 	a.Report()
 	return nil
 }
@@ -233,7 +247,7 @@ func (a *AttachedRoutes) AllEqual(key types.NamespacedName, want int) error {
 }
 
 func (a *AttachedRoutes) Report() {
-	log.WithLabels("ready time", a.ready, "teardown time", a.teardownStart).Infof("Test complete")
+	log.WithLabels("teardown start", a.teardownStart).Infof("Test complete")
 	for name, w := range a.State {
 		top := slices.IndexFunc(w.Samples, func(x Sample) bool {
 			return x.AttachedRoutes == a.Config.Routes
@@ -244,7 +258,9 @@ func (a *AttachedRoutes) Report() {
 		}
 		last := w.Samples[len(w.Samples)-1]
 
-		topT := w.Samples[top].Time.Sub(a.startTime) - a.ready
+		// The simulation's ready signal is asynchronous and can arrive after
+		// attachment. Measure from the test's route-creation start instead.
+		topT := w.Samples[top].Time.Sub(a.startTime)
 		bottomT := last.Time.Sub(a.startTime) - a.teardownStart
 		log.WithLabels("name", name, "add-all", topT, "remove-all", bottomT, "writes", len(w.Samples)).Infof("complete")
 	}

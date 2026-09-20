@@ -1,0 +1,18 @@
+# Backend failover "outlier detection" variant (see README-v2 "With outlier
+# detection"): Istio evicts endpoints after 5 consecutive errors for 10s.
+# Attached to the Service, so it applies to every route.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: outlier
+  namespace: default
+spec:
+  host: backend
+  trafficPolicy:
+    outlierDetection:
+      baseEjectionTime: 10s
+      consecutive5xxErrors: 5
+      consecutiveGatewayErrors: 5
+      consecutiveLocalOriginFailures: 5
+      maxEjectionPercent: 100
+      splitExternalLocalOriginErrors: true
